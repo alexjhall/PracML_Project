@@ -1,0 +1,562 @@
+---
+title: "Prac_ML_Project"
+author: "Alex Hall"
+date: "2023-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      cache = TRUE,
+                      fig.width=10,
+                      fig.height=6)
+
+## Load packages
+## Library
+library(caret)
+library(tidyverse)
+library(ggplot2)
+library(Hmisc)
+library(pgmm)
+library(rpart)
+library(readr)
+library(rattle)
+library(randomForest)
+library(gbm)
+library(forecast)
+library(e1071)
+library(elasticnet)
+library(lubridate)
+library(RANN)
+library(GGally)
+library(parallel)
+library(doParallel)
+library(corrplot) ## for correlation matrix
+
+## Configure parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+
+```
+
+
+# Introduction
+This report has been produced for the Practical Machine Learning project, as part of the Coursera Data Science Specialisation.
+
+The project used data from Velloso et al (2013)^[Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.] who measured participants performing Unilateral Dumbbell Biceps Curls in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). Data were collected using sensors on participants' arms, forearms, belts and the dumbbells.
+
+The goal of the project was to use the a training subset of this data to train a model than could then predict the class (in data as 'classe') in a testing data subset. The project instructions specifically mention prediction as opposed to interpretation or other model performance metrics, so accuracy was prioritised in model-fitting decisions. This report detailed the model fitting and testing process and formed one part of the project, and the other was to make 20 preditions using a testing dataset and enter these predictions into a coursera quiz.
+
+
+# Data overview and cleaning
+Data were sourced from the following urls:
+
+- [Training](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+- [Testing](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+The training dataset contained 19622 observations of 160 variables, whereas the testing dataset contained 20 observations of 160 variables. The variables were mostly the same except the training dataset contained 'classe', the response variable of interest, whereas the testing dataset did not. It also included a 'problem_id' variable for associating test dataset predictions with the correct cousera quiz question.
+
+The data consisted of variables identifying the participants and the specific set of curls they were performing via timestamps and time windows. It then had variables associated with roll, pitch, yaw, acceleration etc from each body sensor. It also contained rows which summarised a set observations in a time window, with statistics such as variance, average, skewness etc. These variables only had data for 'summary row' observations. Importantly, the test dataset did not contain values for these summary variables.
+
+The testing dataset was loaded and renamed as testingQuiz to separate it. The training dataset was loaded and split using random 75% partition into training and testing datasets.
+
+
+
+```{r, include = FALSE}
+## Load data
+
+## Read training data
+training <- read_csv(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+testing <- read_csv(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+# ## Create backup
+training_raw <- training
+# ## Restore backup
+training <- training_raw
+
+# ## Create backup
+testing_raw <- testing
+# ## Restore backup
+testing <- testing_raw
+
+## Put testing aside
+testingQuiz <- testing
+
+```
+
+
+```{r, echo=FALSE}
+## Set seed
+set.seed(1234)
+
+
+## Create training and validation datasets, out of raw training set.
+inTrain = createDataPartition(training_raw$classe, p = 3/4)[[1]]
+training = training_raw[inTrain,]
+testing = training_raw[-inTrain,]
+
+
+## check
+# nrow(training) + nrow(testing)
+# nrow(training_raw)
+
+
+```
+
+After exploration of the data, a number of cleaning steps were identified and applied to each of the datasets: training, testing and testingQuiz. 
+
+It could be argued that the summary level observations had something to add to the model predictions, but because summary level data was not available in the testingQuiz dataset, they could not be used in the model fitting stage. Similarly, there were likely relationships between observations within each curl repetition, set of curl repetitions, and participants and so covariates could have been created at one of these aggregate levels, but the testingQuiz data was not at this level, so the model was not fit at this level either. Therefore the project goal was interpreted as being able to predict the class from a single observation, which could have been at any time in any particular curl execution.
+
+Participant level information such as name, timestamps and time window variables were removed, as explained above. Variables containing summary level data were also removed.
+
+
+```{r}
+## Clean data - Training
+
+# Set class to factor
+training$classe <- factor(training$classe)
+
+# Remove non-predictor variables
+training <-
+    training %>%
+    dplyr::select(
+        -`...1`,
+        -user_name,
+        -raw_timestamp_part_1,
+        -raw_timestamp_part_2,
+        -cvtd_timestamp,
+        -new_window,
+        -num_window
+    )
+
+## Set NA values to NA
+training <-
+    training %>%
+    dplyr::mutate(dplyr::across(
+        .cols = where(is.character),
+        ~ na_if(., "#DIV/0!")
+    ))
+
+## Set character variables to numeric
+training <-
+    training %>%
+    dplyr::mutate(dplyr::across(
+        .cols = where(is.character),
+        as.numeric
+    ))
+
+## Take out variables with high % missing
+## Basically trying to take out aggregate variables
+trainingMissingCols <-
+    colMeans(is.na(training))*100 > 95
+
+## subset based on above
+training <- training[, !trainingMissingCols]
+
+
+```
+
+
+```{r}
+## Clean data - Testing (subset of original training set)
+
+# Set class to factor
+testing$classe <- factor(testing$classe)
+
+# Remove non-predictor variables
+testing <-
+    testing %>%
+    dplyr::select(
+        -`...1`,
+        -user_name,
+        -raw_timestamp_part_1,
+        -raw_timestamp_part_2,
+        -cvtd_timestamp,
+        -new_window,
+        -num_window
+    )
+
+## Set NA values to NA
+testing <-
+    testing %>%
+    dplyr::mutate(dplyr::across(
+        .cols = where(is.character),
+        ~ na_if(., "#DIV/0!")
+    ))
+
+## Set character variables to numeric
+testing <-
+    testing %>%
+    dplyr::mutate(dplyr::across(
+        .cols = where(is.character),
+        as.numeric
+    ))
+
+## Take out variables with high % missing
+## Basically trying to take out aggregate variables
+testingMissingCols <-
+    colMeans(is.na(testing))*100 > 95
+
+## subset based on above
+testing <- testing[, !testingMissingCols]
+
+
+```
+
+
+
+
+```{r}
+## Clean data - TestingQuiz
+
+# Remove non-predictor variables
+testingQuiz <-
+    testingQuiz %>%
+    dplyr::select(
+        -`...1`,
+        -user_name,
+        -raw_timestamp_part_1,
+        -raw_timestamp_part_2,
+        -cvtd_timestamp,
+        -new_window,
+        -num_window,
+        -problem_id
+    )
+
+## Set NA values to NA
+testingQuiz <-
+    testingQuiz %>%
+    dplyr::mutate(dplyr::across(
+        .cols = where(is.character),
+        ~ na_if(., "#DIV/0!")
+    ))
+
+## Take out variables with high % missing
+## Basically trying to take out aggregate variables
+testingQuizMissingCols <-
+    colMeans(is.na(testingQuiz))*100 > 95
+
+## subset based on above
+testingQuiz <- testingQuiz[, !testingQuizMissingCols]
+
+
+
+```
+
+
+# Data transformations
+
+Further exploration of the data revealed varied distributions across the variables which could be corrected somewhat by transformations that would be beneficial for model predictions. 
+
+The following charts show distributions for each of the predictor variables (not 'classe'), demonstrating their variability, before and after transformations. Transformations included standardising the data using center and scale, as well as Yeo-Johnson, which somewhat corrects for skewness and can be applied to negative values as opposed to Box-Cox transformations which can only be applied to values greater than zero.
+
+
+
+```{r}
+## Pre-processing and transformations.
+
+# Set up dataset with only training predictors, not classe factor.
+training_pred <- training[, -which(names(training) == "classe")]
+
+## Centre and scaling to all
+training_transf <- predict(
+    preProcess(training_pred, method = c("center", "scale", "YeoJohnson")),
+    newdata = training_pred
+    )
+
+## Distributions for raw data
+# Histogram set-up
+trainingPL <-
+    training %>%
+    dplyr::select(-classe) %>%
+    pivot_longer(
+        cols = everything(),
+        values_to = "value"
+    )
+
+## Histograms
+trainingPL %>%
+ggplot(aes(value)) +
+    geom_histogram(bins = 20) +
+    facet_wrap(~name, scales = 'free')
+```
+
+```{r}
+## Distributions for transformed data
+# Histogram set-up
+training_transF_PL <-
+    training_transf %>%
+    pivot_longer(
+        cols = everything(),
+        values_to = "value"
+    )
+
+## Histograms
+training_transF_PL %>%
+ggplot(aes(value)) +
+    geom_histogram(bins = 20) +
+    facet_wrap(~name, scales = 'free')
+
+
+```
+
+Building on this, it was suspected that there may be multicollinearity within the dataset. This was confirmed with the correlation plot below that shows variables in the dataset with Pearson's r correlation values above 0.8. This provided rationale for further transforming the data with Principle Components Analysis (PCA) to reduce the number of variables, reducing multicollinearity and improving efficiency. PCA sacrifices some interpretability but was deemed acceptable when the primary goal was prediction accuracy.
+
+
+```{r}
+## Correlation plot, subset to those with high corr
+
+# Identify to high corr variables
+cor_high <- 
+as.data.frame.table(cor(training_pred)) %>% 
+     filter(data.table::between(Freq, 0.8, 1, incbounds = FALSE))
+
+# Create vector of col names
+high_cor_vars <- 
+    unique(as.character(c(cor_high$Var1,cor_high$Var2)))
+
+## Subset data to variables with high corr
+training_pred_cor <- training_pred[, high_cor_vars]
+    
+## Correlation plot
+corrplot(cor(training_pred_cor), method = "shade")
+
+
+
+
+
+```
+
+The next plot shows histograms for the 28 components produced by the PCA transformation.
+
+```{r}
+## PCA transformation, additional step.
+
+## Centre and scaling to all
+training_transf_pca <- predict(
+    preProcess(training_pred, method = c("center", "scale", "YeoJohnson", "pca")),
+    newdata = training_pred
+    )
+
+
+## Testing on transformed data.
+# Histogram set-up
+training_transF_PL <-
+    training_transf_pca %>%
+    pivot_longer(
+        cols = everything(),
+        values_to = "value"
+    )
+
+## Histograms
+training_transF_PL %>%
+ggplot(aes(value)) +
+    geom_histogram(bins = 20) +
+    facet_wrap(~name, scales = 'free')
+
+
+```
+
+# Model fitting
+Following the data preparations above, a number of machine learning models were fitted on the training data and tested against the testing data, with the primary purpose of achieving the highest accuracy possible.
+
+Three models were tested: 
+
+- Classification and regression trees ("rpart")
+- Random forest ("rf")
+- Stochastic Gradient Boosting ("gbm")
+
+TrainControl settings were set across all three model fits to specify k-folds cross validation with 5 folds. A relatively smaller number of folds were chosen to prioritise lower variance, in line with the project goal of prediction accuracy. A cluster was also set up to enable parallel processing and improve model fitting speed. Other than this, tuning parameters were not altered from their defaults.
+
+
+```{r, cache = TRUE}
+## Train model - rpart
+
+## set seed
+set.seed(1234)
+
+
+## Set model train options.
+fitControl <- 
+    trainControl(method = "cv",
+    number = 5,
+    allowParallel = TRUE)
+
+
+## Train model
+modelRpart <- 
+    caret::train(
+        classe ~ .,
+        method = "rpart",
+        data = training,
+        trControl = fitControl,
+        preProcess = c("center", "scale", "YeoJohnson", "pca")
+    )
+
+## Accuracy
+ConfMtx_rpart <- 
+    caret::confusionMatrix(
+        testing$classe,
+        predict(modelRpart, testing)
+    )
+
+
+```
+
+
+```{r, cache = TRUE}
+## Train model - RF
+
+## set seed
+set.seed(1234)
+
+
+## Set model train options.
+fitControl <- 
+    trainControl(method = "cv",
+    number = 5,
+    allowParallel = TRUE)
+
+
+
+## Train model 
+modelRF <- 
+    caret::train(
+        classe ~ .,
+        method = "rf",
+        data = training,
+        trControl = fitControl,
+        preProcess = c("center", "scale", "YeoJohnson", "pca")
+    )
+
+
+## Accuracy
+ConfMtx_rf <- 
+    caret::confusionMatrix(
+        testing$classe,
+        predict(modelRF, testing)
+    )
+
+
+```
+
+
+
+
+```{r, cache = TRUE}
+## Train model - gbm
+
+## set seed
+set.seed(1234)
+
+
+## Set model train options.
+fitControl <- 
+    trainControl(method = "cv",
+    number = 5,
+    allowParallel = TRUE)
+
+
+## Train model
+modelGBM <- 
+    caret::train(
+        classe ~ .,
+        method = "gbm",
+        data = as.data.frame(training),
+        trControl = fitControl,
+        preProcess = c("center", "scale", "YeoJohnson", "pca"),
+        verbose = FALSE # Reduces model fitting output
+    )
+
+
+## Accuracy
+ConfMtx_gbm <- 
+    caret::confusionMatrix(
+        testing$classe,
+        predict(modelGBM, testing)
+    )
+
+
+```
+
+
+
+```{r, include = FALSE}
+## De-register parallel processing cluster
+stopCluster(cluster)
+registerDoSEQ()
+
+
+
+```
+
+
+
+# Testing and discussion
+Model accuracy (out of sample error) was tested by creating confusion matrices for the class variable in the testing dataset against the prediction of the class variable from the fitted models. The resulting accuracies are in the table below and show the highest predictive performance for the random forest model (98%), followed by Stochastic Gradient Boosting (83%) and lastly the Classification and Regression Tree (CART), with 40% accuracy.
+
+Given that the random forest model achieved such high accuracy, it was chosen for the prediction exercise part of this project. 
+
+
+```{r}
+## Prepare summary table of model accuracies.
+ModelSummaryTable <-
+    data.frame(
+        Model = c(
+            "Classification and regression trees (rpart)",
+            "Random forest (rf)",
+            "Stochastic Gradient Boosting (gbm)"
+        ),
+        Accuracy = c(
+            ConfMtx_rpart$overall[1],
+            ConfMtx_rf$overall[1],
+            ConfMtx_gbm$overall[1]
+        )
+    )
+
+## Round accuracy figures
+ModelSummaryTable$Accuracy <- round(ModelSummaryTable$Accuracy, 2)
+
+## Print
+print(ModelSummaryTable)
+
+
+```
+
+
+
+
+```{r, include = FALSE}
+## Quiz predictions
+## Try to predict test
+testQuizPredict <-
+    as.data.frame(
+        predict(modelRF, testingQuiz)
+    )
+
+## Print
+# print(testQuizPredict)
+
+## Save predictions locally.
+# writexl::write_xlsx(testQuizPredict, "QuizPredictions.xlsx")
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
